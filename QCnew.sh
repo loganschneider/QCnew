@@ -2,9 +2,18 @@
 
 # Run this QC script from within the folder of PLINK BINARY files that you want to QC
 # This runs without needing a jobsub script (it's so short that it's not worth it)
+# Files needed:
+# -PLINK binaries (bim/bed/fam) labeled by genotype/chip/array pseudocohort(s) names (e.g. Affy_* or EUR_*)
+# -preferrably a PLINK phenotype file(s) name genotype/chip/array pseudocohort(s) names_pheno.txt (e.g. Affy_pheno.txt, EUR_pheno.txt)
+#  +needs to have 2+n headers http://zzz.bwh.harvard.edu/plink/data.shtml#pheno
+#  +FID, IID, n phenotypes (preferrably at least 1 categorical/case-control phenotype)
+#  +if no phenotype file provided for first-step QC, will generate one with assumption of all controls for QC, GenABEL.sh and cohorts2keep.sh assume a categorical/continuous phenotype exists
+#  +if no BINARY phenotype provided, will add on arbitrary control status for all individuals as part of HWE-deviation QC step
 
-module load plink
+module load plink/1.90
 module load r
+
+workDir=$PWD
 
 echo "Enter name of study population (e.g. WSC, MrOS, APOE), followed by [ENTER]: "
 read study
@@ -25,17 +34,27 @@ done
 echo "Enter BINARY phenotype name as it appears in the {cohortname}_pheno.txt file (or leave blank), followed by [ENTER]: "
 read pheno
 
-workDir=$PWD
-
 # loop over cohort names in "list" to submit jobs
 for k in "${list[@]}"
 do
 
 #generate the long ${k}_QC.txt file, and can cat additional info as it goes
+if [ -z $pheno ]
+then
+
 cat <<EOF >${k}_QC.txt
-This is the QC log file for the ${k} cohort and ${pheno} phenotype
+This is the QC log file for the ${k} pseudocohort w/o a binary phenotype specified
 
 EOF
+
+else
+
+cat <<EOF >${k}_QC.txt
+This is the QC log file for the ${k} pseudocohort and the ${pheno} binary phenotype specified
+
+EOF
+
+fi
 
 	#get file names based on the "cohort"/chip name, put into bfile variable
 	#use that to initiate plink's first cleaning, from there the rest refer to the outputs
@@ -44,17 +63,45 @@ EOF
 	
 	#Had to add this because I believe the arbitrary or unrecorded phenotype in column 6 was making analyses confusing
 	#So, I just put in the binary phenotype reported in the pheno file (assuming one is provided)
+	
+	#If no BINARY phenotype entered then assume only continuous and set all individuals to control (for HWE QC)
 	if [ -z $pheno ]
 	then
-		echo "binary phenotype name not specified"
+		echo "No BINARY phenotype specified, so HWE deviation will be calculated on all individuals as 'controls'"
+		pheno=Aff
 		
 cat <<EOF >phenoinfam.R
-famname <- list.files(pattern="^${k}.*fam$")
-fam <- read.table(famname)
-write.table(fam,file=paste("${k}","famWunknownphenos",sep="."),row.names=F,col.names=F,quote=F,sep=" ")
-fam[,"V6"] <- -9
-nonames <- unname(fam)
-write.table(fam,file=famname,row.names=F,col.names=F,quote=F,sep=" ")
+#if pheno file exists will add in "Aff" pheno, under assumption:
+#-no BINARY phenotype entered, implies only categorical phenotype
+#otherwise, just create a phenotype file with arbitrary non-affected phenotype status for all samples (e.g. 1 = control)
+if(file.exists("${k}_pheno.txt")){
+	#need to edit fam files to reflect "control" status in all inviduals for HWE
+	famname <- list.files(pattern="^${k}.*fam$")
+	fam <- read.table(famname)
+	write.table(fam,file=paste("${k}","famWunknownphenos",sep="."),row.names=F,col.names=F,quote=F,sep=" ")
+	fam[,"V6"] <- 1
+	nonames <- unname(fam)
+	write.table(fam,file=famname,row.names=F,col.names=F,quote=F,sep=" ")
+	#need to generate phenotype file with "control" status in all individuals for HWE
+	phenoname <- list.files(pattern="${k}_pheno.txt")
+	pheno <- read.table(phenoname,header=T)
+	write.table(pheno,file="originalphenofile.txt",row.names=F,quote=F,sep=" ")
+	pheno[,"${pheno}"] <- 1 #adding in arbitrary control status for all
+	write.table(pheno,file=phenoname,row.names=F,quote=F,sep=" ")
+} else { #if no pheno file provided, will generate an arbitrary one will all as "controls" for HWE
+	#need to edit fam files to reflect "control" status in all inviduals for HWE
+	famname <- list.files(pattern="^${k}.*fam$")
+	fam <- read.table(famname)
+	write.table(fam,file=paste("${k}","famWunknownphenos",sep="."),row.names=F,col.names=F,quote=F,sep=" ")
+	fam[,"V6"] <- 1
+	nonames <- unname(fam)
+	write.table(fam,file=famname,row.names=F,col.names=F,quote=F,sep=" ")
+	#need to generate phenotype file with "control" status in all individuals for HWE
+	pheno <- fam[,1:2]
+	pheno[,"${pheno}"] <- 1 #adding in arbitrary control status for all
+	names(pheno) <- c("FID","IID","${pheno}")
+	write.table(pheno,file="${k}_pheno.txt",row.names=F,quote=F,sep=" ")
+}
 q()
 EOF
 		
@@ -194,6 +241,7 @@ EOF
 	#next comes cleaning out CONTROLS' SNPs that are out of HWE - if a pheno file has been included
 	#	can generate the pheno file, using the fam2pheno.R script: https://www.dropbox.com/s/g8e5zzwkvdc8ny0/fam2pheno.R?dl=0
 	#	must the ${k}_pheno.txt file in the same folder as the files being QCed
+	#	recall, if no BINARY phenotype exists/specified all individuals are treated as "controls" for purposes of HWE-deviation assessment
 	FILE=${k}_pheno.txt
 	
 	if [ -f $FILE ];
@@ -215,7 +263,7 @@ EOF
 		R CMD BATCH HWE.R
 		
 		printf '\n' >> ${k}_QC.txt
-		echo 'Box 6: SNPs removed due to departure from HWE (p<1e-7) in CONTROLS using phenotype '${pheno} >> ${k}_QC.txt
+		echo 'Box 6: SNPs removed due to departure from HWE (p<1e-7) in CONTROLS (if BINARY phenotype) or cohort (if no BINARY phenotype specified) using phenotype '${pheno} >> ${k}_QC.txt
 		cat ${k}_ctrl_nonHWE.txt >> ${k}_QC.txt
 		sed -i -e '$a\' ${k}_QC.txt
 		
@@ -273,7 +321,25 @@ EOF
 	module load python/2.7
 	export PYTHONPATH=~/python/lib/python2.7/site-packages/:$PYTHONPATH
 	/srv/gsfs0/home/logands/python/bin/snpflip -b $workDir/${k}_NOdups.bim -f /srv/gsfs0/projects/mignot/PLMGWAS/snpflip-master/human_g1k_v37.fasta -o $workDir/${k}_snpflip_output
-	plink --bfile ${k}_NOdups --flip ${k}_snpflip_output.reverse --exclude ${k}_snpflip_output.ambiguous --make-bed --out ${k}_NOdups_aligned
+	
+	reverse="${k}_snpflip_output.reverse"
+	ambiguous="${k}_snpflip_output.ambiguous"
+	if [ -f "$reverse" ] && [ -f "$ambiguous" ]
+	then
+		echo "$reverse and $ambiguous found."
+		plink --bfile ${k}_NOdups --flip ${k}_snpflip_output.reverse --exclude ${k}_snpflip_output.ambiguous --make-bed --out ${k}_NOdups_aligned
+	elif [ -f "$reverse" ] && ! [ -f "$ambiguous" ]
+	then
+		echo "$reverse found, but $ambiguous not found."
+		plink --bfile ${k}_NOdups --flip ${k}_snpflip_output.reverse --make-bed --out ${k}_NOdups_aligned
+	elif ! [ -f "$reverse" ] && [ -f "$ambiguous" ]
+	then
+		echo "$reverse not found, but $ambiguous found."
+		plink --bfile ${k}_NOdups --exclude ${k}_snpflip_output.ambiguous --make-bed --out ${k}_NOdups_aligned
+	else
+		echo "neither $reverse nor $ambiguous found."
+		plink --bfile ${k}_NOdups --make-bed --out ${k}_NOdups_aligned
+	fi
 	
 	#Include the number/ID of reverse->flipped and ambiguous->removed SNPs
 	cat ${k}_snpflip_output.reverse | wc -l > xxx
